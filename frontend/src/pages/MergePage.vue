@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Sketch } from '@/types'
+import { latestVersion } from '@/types'
 import ClosureBadge from '@/components/common/ClosureBadge.vue'
 import GridCanvas from '@/components/common/GridCanvas.vue'
 import SegmentTag from '@/components/common/SegmentTag.vue'
@@ -37,9 +38,27 @@ const caveSegments = computed(() =>
   segmentState.segments.filter((segment) => !selectedCaveId.value || segment.caveId === selectedCaveId.value)
 )
 
+/** 当前洞穴下存在未签认草稿的草图（含仅草稿与签认后修订中） */
+const pendingDrafts = computed<Sketch[]>(() =>
+  sketchState.sketches
+    .filter(
+      (sketch) =>
+        sketch.draft && caveSegments.value.some((segment) => segment.id === sketch.segmentId)
+    )
+    .sort((a, b) => a.mergeOrder - b.mergeOrder)
+)
+
+/**
+ * 可拼合图幅：仅至少有一个签认版本的草图参与，内容取最新签认版本。
+ * 仅草稿、修订中的草图不在此列（修订中草图仍显示其上一签认版本）。
+ */
 const mergeSketches = computed<Sketch[]>(() =>
   sketchState.sketches
-    .filter((sketch) => caveSegments.value.some((segment) => segment.id === sketch.segmentId))
+    .filter(
+      (sketch) =>
+        sketch.versions.length > 0 &&
+        caveSegments.value.some((segment) => segment.id === sketch.segmentId)
+    )
     .sort((a, b) => a.mergeOrder - b.mergeOrder)
 )
 
@@ -49,7 +68,9 @@ function segmentOf(sketch: Sketch): string {
 }
 
 function widthOf(sketch: Sketch): number {
-  return Math.max(88, Math.round(sketch.gridCount * (200 / Math.max(10, sketch.scale)) * 4))
+  const version = latestVersion(sketch)
+  if (!version) return 88
+  return Math.max(88, Math.round(version.gridCount * (200 / Math.max(10, version.scale)) * 4))
 }
 
 const totalWidth = computed(() =>
@@ -90,17 +111,34 @@ const { result: closureResult } = useClosureCheck(caveStations)
 function autoAlign(): void {
   const list = mergeSketches.value
   if (list.length === 0) {
-    ElMessage.warning('当前洞穴暂无可拼合草图')
+    ElMessage.warning('当前洞穴暂无已签认可拼合草图')
     return
   }
-  const base = Math.min(...list.map((sketch) => stakeToNumber(sketch.anchorStake)))
+  // 同一洞段存在未签认草稿时必须先签认，避免把现场修订漏进/误拼，吸附整体停下
+  if (pendingDrafts.value.length > 0) {
+    const detail = pendingDrafts.value
+      .map((sketch) => `${sketch.code}（洞段 ${segmentOf(sketch)}，锚点 ${sketch.draft?.anchorStake ?? '—'}）`)
+      .join('、')
+    snapLog.value = [
+      `按桩号吸附已中止：以下草图存在未签认草稿，请先到草图工作台签认：${detail}`,
+      '其余已签认图幅仍正常显示，可拖动手动对齐。'
+    ]
+    ElMessageBox.alert(
+      `以下草图尚有未签认草稿，按桩号吸附已中止：\n${detail}\n\n请先在「草图工作台」签认后再吸附；已签认图幅仍正常显示。`,
+      '存在未签认草稿',
+      { type: 'warning', confirmButtonText: '知道了' }
+    )
+    return
+  }
+  const base = Math.min(...list.map((sketch) => stakeToNumber(latestVersion(sketch)!.anchorStake)))
   const logs: string[] = []
   list.forEach((sketch) => {
-    const stake = stakeToNumber(sketch.anchorStake)
+    const version = latestVersion(sketch)!
+    const stake = stakeToNumber(version.anchorStake)
     const target = Math.round((stake - base) * PX_PER_METER)
     offsets[sketch.id] = target
     snapped[sketch.id] = true
-    logs.push(`${sketch.code} 锚点 ${sketch.anchorStake} → 偏移 ${target}px`)
+    logs.push(`${sketch.code} v${version.version} 锚点 ${version.anchorStake} → 偏移 ${target}px`)
   })
   snapLog.value = logs
   ElMessage.success(`已按桩号锚点吸附 ${list.length} 张图幅`)
@@ -145,21 +183,28 @@ function onMouseUp(): void {
 interface MergeRow {
   order: number
   code: string
+  version: number
   segment: string
+  author: string
   anchorStake: string
   offset: number
   snapped: boolean
 }
 
 const mergeRows = computed<MergeRow[]>(() =>
-  mergeSketches.value.map((sketch, index) => ({
-    order: index + 1,
-    code: sketch.code,
-    segment: segmentOf(sketch),
-    anchorStake: sketch.anchorStake,
-    offset: offsets[sketch.id] ?? 0,
-    snapped: snapped[sketch.id] ?? false
-  }))
+  mergeSketches.value.map((sketch, index) => {
+    const version = latestVersion(sketch)!
+    return {
+      order: index + 1,
+      code: sketch.code,
+      version: version.version,
+      segment: segmentOf(sketch),
+      author: version.author,
+      anchorStake: version.anchorStake,
+      offset: offsets[sketch.id] ?? 0,
+      snapped: snapped[sketch.id] ?? false
+    }
+  })
 )
 
 async function move(index: number, direction: -1 | 1): Promise<void> {
@@ -179,7 +224,9 @@ function exportMergeTable(): void {
     [
       { key: 'order', label: '拼合顺序' },
       { key: 'code', label: '草图编号' },
+      { key: 'version', label: '签认版本' },
       { key: 'segment', label: '洞段' },
+      { key: 'author', label: '绘制人' },
       { key: 'anchorStake', label: '锚点桩号' },
       { key: 'offset', label: '对齐偏移(px)' },
       { key: 'snapped', label: '是否吸附' }
@@ -195,7 +242,7 @@ function exportMergeTable(): void {
       <div>
         <h2 class="page-title">图幅拼合视图</h2>
         <p class="page-sub">
-          拖动图幅可按相邻边缘吸附对齐，也可按桩号锚点一键对齐；下方输出拼合顺序表，顺序可直接调整。
+          仅已签认图幅参与拼合（取最新签认版本）；拖动图幅可按相邻边缘吸附，按桩号锚点一键对齐前会检查未签认草稿。
         </p>
       </div>
       <div class="head-actions">
@@ -204,11 +251,38 @@ function exportMergeTable(): void {
       </div>
     </div>
 
+    <el-alert
+      v-if="pendingDrafts.length > 0"
+      class="draft-alert"
+      type="warning"
+      show-icon
+      :closable="false"
+      title="存在未签认草稿，按桩号吸附将中止"
+    >
+      <template #default>
+        待签认：
+        <el-tag
+          v-for="sketch in pendingDrafts"
+          :key="sketch.id"
+          type="warning"
+          size="small"
+          effect="plain"
+          class="draft-tag"
+        >
+          {{ sketch.code }}（洞段 {{ segmentOf(sketch) }}）
+        </el-tag>
+        <span class="draft-hint">草稿不参与拼合；签认后才会进入/更新图幅。</span>
+      </template>
+    </el-alert>
+
     <div class="toolbar">
       <el-select v-model="selectedCaveId" placeholder="选择洞穴" style="width: 220px">
         <el-option v-for="cave in caveState.caves" :key="cave.id" :label="cave.name" :value="cave.id" />
       </el-select>
-      <el-tag effect="plain">图幅 {{ mergeSketches.length }} 张</el-tag>
+      <el-tag effect="plain">已签认图幅 {{ mergeSketches.length }} 张</el-tag>
+      <el-tag :type="pendingDrafts.length > 0 ? 'warning' : 'success'" effect="plain">
+        未签认草稿 {{ pendingDrafts.length }} 张
+      </el-tag>
       <el-tag effect="plain">总宽 {{ totalWidth }} px</el-tag>
       <div class="seg-tags">
         <SegmentTag
@@ -248,13 +322,13 @@ function exportMergeTable(): void {
             stroke-width="1.6"
           />
           <text :x="(offsets[sketch.id] ?? 0) + 8" :y="62 + (index % 2) * 10" font-size="12" fill="#1f3a4d">
-            {{ sketch.code }}
+            {{ sketch.code }} · v{{ latestVersion(sketch)?.version }}
           </text>
           <text :x="(offsets[sketch.id] ?? 0) + 8" :y="80 + (index % 2) * 10" font-size="11" fill="#4a5b6b">
-            锚点 {{ sketch.anchorStake }}
+            锚点 {{ latestVersion(sketch)?.anchorStake }}
           </text>
           <text :x="(offsets[sketch.id] ?? 0) + 8" :y="96 + (index % 2) * 10" font-size="11" fill="#7a8896">
-            1:{{ sketch.scale }} · {{ sketch.gridCount }} 格
+            1:{{ latestVersion(sketch)?.scale }} · {{ latestVersion(sketch)?.gridCount }} 格
           </text>
           <line
             :x1="offsets[sketch.id] ?? 0"
@@ -267,14 +341,15 @@ function exportMergeTable(): void {
         </g>
         <text
           v-if="mergeSketches.length === 0"
-          :x="CANVAS_W / 2 - 110"
+          :x="CANVAS_W / 2 - 130"
           :y="CANVAS_H / 2"
           font-size="13"
           fill="#8a97a3"
         >
-          该洞穴暂无草图图幅，请先到「草图工作台」建立
+          该洞穴暂无已签认图幅，请先到「草图工作台」建立并签认
         </text>
         <template #legend>
+          <span>仅已签认图幅显示</span>
           <span>拖动图幅可移动</span>
           <span>绿框 = 未吸附</span>
           <span>蓝框 = 已吸附对齐</span>
@@ -301,23 +376,29 @@ function exportMergeTable(): void {
       </div>
     </div>
 
-    <h3 class="section-title">图幅拼合顺序表</h3>
+    <h3 class="section-title">图幅拼合顺序表（已签认版本）</h3>
     <el-table :data="mergeRows" border stripe>
-      <el-table-column prop="order" label="拼合顺序" width="100" />
-      <el-table-column prop="code" label="草图编号" width="120" />
-      <el-table-column prop="segment" label="洞段" width="120" />
-      <el-table-column prop="anchorStake" label="桩号对齐锚点" width="150" />
-      <el-table-column label="对齐偏移" width="120">
+      <el-table-column prop="order" label="拼合顺序" width="90" />
+      <el-table-column prop="code" label="草图编号" width="110" />
+      <el-table-column label="签认版本" width="90">
+        <template #default="{ row }: { row: MergeRow }">
+          <el-tag type="success" size="small" effect="plain">v{{ row.version }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="segment" label="洞段" width="100" />
+      <el-table-column prop="author" label="绘制人" width="100" />
+      <el-table-column prop="anchorStake" label="桩号对齐锚点" width="140" />
+      <el-table-column label="对齐偏移" width="110">
         <template #default="{ row }: { row: MergeRow }">{{ row.offset }} px</template>
       </el-table-column>
-      <el-table-column label="吸附状态" width="120">
+      <el-table-column label="吸附状态" width="110">
         <template #default="{ row }: { row: MergeRow }">
           <el-tag :type="row.snapped ? 'success' : 'info'" size="small" effect="plain">
             {{ row.snapped ? '已吸附' : '未吸附' }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="调整顺序" width="180">
+      <el-table-column label="调整顺序" width="160">
         <template #default="{ $index }: { $index: number }">
           <el-button link type="primary" size="small" :disabled="$index === 0" @click="move($index, -1)">上移</el-button>
           <el-button
@@ -339,6 +420,16 @@ function exportMergeTable(): void {
 .head-actions {
   display: flex;
   gap: 8px;
+}
+.draft-alert {
+  margin-bottom: 12px;
+}
+.draft-tag {
+  margin: 0 6px 0 0;
+}
+.draft-hint {
+  margin-left: 4px;
+  font-size: 12px;
 }
 .seg-tags {
   display: flex;

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Sketch, Station } from '@/types'
+import type { Sketch, SketchStatus, SketchVersion, Station } from '@/types'
+import { activeContent, latestVersion, sketchStatus } from '@/types'
 import BearingInput from '@/components/common/BearingInput.vue'
 import GridCanvas from '@/components/common/GridCanvas.vue'
 import { useStore } from '@/hooks/usePersistentStore'
@@ -10,7 +11,6 @@ import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
 import { sketchStore } from '@/stores/sketchStore'
 import { toRadians } from '@/utils/survey'
-import { uid } from '@/utils/id'
 
 const caveState = useStore(caveStore)
 const segmentState = useStore(segmentStore)
@@ -23,6 +23,7 @@ const PAD = 46
 
 const selectedCaveId = ref<string>(caveState.caves[0]?.id ?? '')
 const selectedSegmentId = ref<string>('')
+/** 正在编辑草稿的草图 id；null 表示新建 */
 const editingId = ref<string | null>(null)
 /** 草图朝向基准方位角：把洞段整体旋转到图纸正上方为前进方向 */
 const baseBearing = ref(0)
@@ -36,6 +37,13 @@ const form = reactive({
   anchorStake: 'K0+000',
   imageNote: ''
 })
+
+/** 历史版本弹窗 */
+const historyVisible = ref(false)
+const historySketch = ref<Sketch | null>(null)
+const historyVersions = computed<SketchVersion[]>(() =>
+  historySketch.value ? [...historySketch.value.versions].sort((a, b) => b.version - a.version) : []
+)
 
 const segmentOptions = computed(() =>
   segmentState.segments.filter((segment) => !selectedCaveId.value || segment.caveId === selectedCaveId.value)
@@ -136,47 +144,179 @@ const segmentSketches = computed(() =>
     .sort((a, b) => a.mergeOrder - b.mergeOrder)
 )
 
-async function submit(): Promise<void> {
-  if (!selectedSegmentId.value) {
-    ElMessage.warning('请先选择洞段')
-    return
-  }
-  if (!form.code.trim()) {
-    ElMessage.warning('请填写草图编号')
-    return
-  }
-  const existing = sketchState.sketches.find((item) => item.id === editingId.value)
-  const sketch: Sketch = {
-    id: existing?.id ?? uid('sk'),
-    segmentId: selectedSegmentId.value,
-    code: form.code.trim(),
+/** 该洞段待签认草稿数量（含仅有草稿、以及签认后修订中的） */
+const pendingDraftCount = computed(() => segmentSketches.value.filter((sketch) => sketch.draft).length)
+
+function readFormContent() {
+  return {
     gridCount: Number(form.gridCount) || 0,
     scale: Number(form.scale) || 100,
     author: form.author.trim(),
-    mergeOrder: Number(form.mergeOrder) || 1,
     anchorStake: form.anchorStake.trim(),
     imageNote: form.imageNote.trim()
   }
-  await sketchStore.getState().save(sketch)
-  ElMessage.success(existing ? '草图记录已更新' : '草图记录已建立')
+}
+
+function validateBeforeSave(signing: boolean): boolean {
+  if (!selectedSegmentId.value) {
+    ElMessage.warning('请先选择洞段')
+    return false
+  }
+  if (!form.code.trim()) {
+    ElMessage.warning('请填写草图编号')
+    return false
+  }
+  if (signing && !form.author.trim()) {
+    ElMessage.warning('签认需填写绘制人，以便随版本记录')
+    return false
+  }
+  return true
+}
+
+/** 保存草稿：新建时落为「仅草稿」，已有草稿时覆盖更新；草稿不参与拼合 */
+async function saveDraft(signing = false): Promise<void> {
+  if (!validateBeforeSave(signing)) return
+  const id = await sketchStore.getState().saveDraft({
+    id: editingId.value ?? undefined,
+    segmentId: selectedSegmentId.value,
+    code: form.code.trim(),
+    mergeOrder: Number(form.mergeOrder) || 1,
+    content: readFormContent()
+  })
+  if (signing) {
+    await sketchStore.getState().signOff(id)
+    const signed = sketchState.sketches.find((item) => item.id === id)
+    ElMessage.success(`草图「${form.code.trim()}」已签认冻结为 v${signed?.versions.length ?? 1}`)
+  } else {
+    ElMessage.success(editingId.value ? '草稿已更新，尚未签认，不参与拼合' : '草稿已保存，签认后才会进入图幅拼合')
+  }
   resetForm()
 }
 
-function editSketch(sketch: Sketch): void {
+/** 继续编辑已有草稿（仅草稿 / 修订中） */
+function editDraft(sketch: Sketch): void {
+  const content = sketch.draft
+  if (!content) return
   editingId.value = sketch.id
   form.code = sketch.code
-  form.gridCount = sketch.gridCount
-  form.scale = sketch.scale
-  form.author = sketch.author
+  form.gridCount = content.gridCount
+  form.scale = content.scale
+  form.author = content.author
   form.mergeOrder = sketch.mergeOrder
-  form.anchorStake = sketch.anchorStake
-  form.imageNote = sketch.imageNote
+  form.anchorStake = content.anchorStake
+  form.imageNote = content.imageNote
+}
+
+/** 从最新签认版本开出一份新草稿，之后的修改在草稿上进行，旧版本保持冻结 */
+async function beginRevision(sketch: Sketch): Promise<void> {
+  const base = latestVersion(sketch)
+  if (!base) return
+  editingId.value = sketch.id
+  form.code = sketch.code
+  form.gridCount = base.gridCount
+  form.scale = base.scale
+  form.author = base.author
+  form.mergeOrder = sketch.mergeOrder
+  form.anchorStake = base.anchorStake
+  form.imageNote = base.imageNote
+  await sketchStore.getState().saveDraft({
+    id: sketch.id,
+    segmentId: sketch.segmentId,
+    code: sketch.code,
+    mergeOrder: sketch.mergeOrder,
+    content: {
+      gridCount: base.gridCount,
+      scale: base.scale,
+      author: base.author,
+      anchorStake: base.anchorStake,
+      imageNote: base.imageNote
+    }
+  })
+  ElMessage.info(`已基于 v${base.version} 开出新草稿，保存签认后生成 v${base.version + 1}`)
+}
+
+/** 签认列表中已有草稿的草图 */
+async function signSketch(sketch: Sketch): Promise<void> {
+  if (!sketch.draft) return
+  if (!sketch.draft.author.trim()) {
+    ElMessage.warning('该草稿未填写绘制人，请先编辑补全再签认')
+    return
+  }
+  await ElMessageBox.confirm(
+    `确认签认草图「${sketch.code}」？签认后当前内容将冻结为 v${sketch.versions.length + 1}，不可再改。`,
+    '签认确认',
+    { type: 'warning', confirmButtonText: '签认', cancelButtonText: '取消' }
+  )
+  await sketchStore.getState().signOff(sketch.id)
+  ElMessage.success(`草图「${sketch.code}」已签认，可参与图幅拼合`)
+}
+
+/** 取消修订：丢弃草稿，仅草稿草图会整体删除 */
+async function discardDraft(sketch: Sketch): Promise<void> {
+  const draftOnly = sketch.versions.length === 0
+  await ElMessageBox.confirm(
+    draftOnly
+      ? `草图「${sketch.code}」尚未签认过，丢弃草稿将删除整张草图，确认？`
+      : `确认丢弃草图「${sketch.code}」的未签认草稿？内容将回到 v${sketch.versions.length}。`,
+    '丢弃草稿确认',
+    { type: 'warning', confirmButtonText: '丢弃', cancelButtonText: '取消' }
+  )
+  await sketchStore.getState().discardDraft(sketch.id)
+  if (editingId.value === sketch.id) resetForm()
+  ElMessage.success(draftOnly ? '未签认草图已删除' : '草稿已丢弃，内容回到最新签认版本')
 }
 
 async function removeSketch(sketch: Sketch): Promise<void> {
-  await ElMessageBox.confirm(`确认删除草图「${sketch.code}」？`, '删除确认', { type: 'warning' })
+  await ElMessageBox.confirm(
+    `确认删除草图「${sketch.code}」？其 ${sketch.versions.length} 个签认版本与草稿都将一并删除。`,
+    '删除确认',
+    { type: 'warning' }
+  )
   await sketchStore.getState().remove(sketch.id)
+  if (editingId.value === sketch.id) resetForm()
   ElMessage.success('草图记录已删除')
+}
+
+function openHistory(sketch: Sketch): void {
+  historySketch.value = sketch
+  historyVisible.value = true
+}
+
+const STATUS_META: Record<SketchStatus, { type: 'info' | 'success' | 'warning' }> = {
+  'draft-only': { type: 'warning' },
+  signed: { type: 'success' },
+  revising: { type: 'info' }
+}
+
+function statusOf(sketch: Sketch): SketchStatus {
+  return sketchStatus(sketch)
+}
+
+function statusLabel(sketch: Sketch): string {
+  switch (statusOf(sketch)) {
+    case 'draft-only':
+      return '草稿（未签认）'
+    case 'signed':
+      return `已签认 v${sketch.versions.length}`
+    case 'revising':
+      return `修订中（最新 v${sketch.versions.length}）`
+  }
+}
+
+function statusType(sketch: Sketch): 'info' | 'success' | 'warning' {
+  return STATUS_META[statusOf(sketch)].type
+}
+
+/** 列表展示的内容：草稿优先，否则最新签认版本 */
+function contentOf(sketch: Sketch) {
+  return activeContent(sketch)
+}
+
+function formatDateTime(iso: string): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return iso
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 </script>
 
@@ -186,7 +326,7 @@ async function removeSketch(sketch: Sketch): Promise<void> {
       <div>
         <h2 class="page-title">草图工作台</h2>
         <p class="page-sub">
-          在坐标纸网格上按测点折线绘制洞段平面草图，标注测点桩号与倾角箭头；网格比例与草图记录一一对应。
+          在坐标纸网格上按测点折线绘制洞段平面草图，标注测点桩号与倾角箭头。每张草图分草稿与已签认：草稿可继续改但不参与拼合，签认后内容冻结为新版本。
         </p>
       </div>
       <el-tag type="info" effect="plain">当前比例 1 : {{ form.scale }}</el-tag>
@@ -201,6 +341,9 @@ async function removeSketch(sketch: Sketch): Promise<void> {
       </el-select>
       <el-tag effect="plain">测点 {{ segmentStations.length }} 个</el-tag>
       <el-tag effect="plain">草图 {{ segmentSketches.length }} 张</el-tag>
+      <el-tag :type="pendingDraftCount > 0 ? 'warning' : 'success'" effect="plain">
+        待签认草稿 {{ pendingDraftCount }} 张
+      </el-tag>
       <div class="base-bearing">
         <BearingInput v-model="baseBearing" kind="bearing" label="草图基准方位" @invalid="(msg: string) => ElMessage.warning(msg)" />
       </div>
@@ -252,7 +395,7 @@ async function removeSketch(sketch: Sketch): Promise<void> {
       </GridCanvas>
 
       <el-card shadow="never" class="sketch-form">
-        <template #header>{{ editingId ? '编辑草图记录' : '新建草图记录' }}</template>
+        <template #header>{{ editingId ? '编辑草稿（未签认）' : '新建草图（先存草稿）' }}</template>
         <el-form label-width="90px" size="small">
           <el-form-item label="草图编号" required>
             <el-input v-model="form.code" placeholder="如 S-03" />
@@ -264,7 +407,7 @@ async function removeSketch(sketch: Sketch): Promise<void> {
             <el-input-number v-model="form.scale" :min="10" :step="10" :controls="false" style="width: 100%" />
           </el-form-item>
           <el-form-item label="绘制人">
-            <el-input v-model="form.author" />
+            <el-input v-model="form.author" placeholder="签认时随版本记录" />
           </el-form-item>
           <el-form-item label="拼合顺序">
             <el-input-number v-model="form.mergeOrder" :min="1" :controls="false" style="width: 100%" />
@@ -276,7 +419,8 @@ async function removeSketch(sketch: Sketch): Promise<void> {
             <el-input v-model="form.imageNote" type="textarea" :rows="2" placeholder="草图内容与左壁/右壁标注说明" />
           </el-form-item>
           <div class="form-actions">
-            <el-button type="primary" size="small" @click="submit">保存</el-button>
+            <el-button size="small" @click="saveDraft(false)">保存草稿</el-button>
+            <el-button type="primary" size="small" @click="saveDraft(true)">保存并签认</el-button>
             <el-button v-if="editingId" size="small" @click="resetForm">取消</el-button>
           </div>
         </el-form>
@@ -285,22 +429,78 @@ async function removeSketch(sketch: Sketch): Promise<void> {
 
     <h3 class="section-title">该洞段草图清单</h3>
     <el-table :data="segmentSketches" border stripe>
-      <el-table-column prop="mergeOrder" label="拼合顺序" width="100" />
-      <el-table-column prop="code" label="草图编号" width="110" />
-      <el-table-column prop="gridCount" label="格数" width="90" />
-      <el-table-column label="比例" width="110">
-        <template #default="{ row }: { row: Sketch }">1 : {{ row.scale }}</template>
-      </el-table-column>
-      <el-table-column prop="author" label="绘制人" width="100" />
-      <el-table-column prop="anchorStake" label="锚点桩号" width="130" />
-      <el-table-column prop="imageNote" label="图片数据说明" min-width="200" show-overflow-tooltip />
-      <el-table-column label="操作" width="130" fixed="right">
+      <el-table-column prop="mergeOrder" label="拼合顺序" width="90" />
+      <el-table-column prop="code" label="草图编号" width="100" />
+      <el-table-column label="签认状态" width="170">
         <template #default="{ row }: { row: Sketch }">
-          <el-button link type="primary" size="small" @click="editSketch(row)">编辑</el-button>
+          <el-tag :type="statusType(row)" size="small" effect="plain">{{ statusLabel(row) }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="版本" width="70">
+        <template #default="{ row }: { row: Sketch }">{{ row.versions.length }}</template>
+      </el-table-column>
+      <el-table-column label="格数" width="70">
+        <template #default="{ row }: { row: Sketch }">{{ contentOf(row)?.gridCount ?? '—' }}</template>
+      </el-table-column>
+      <el-table-column label="比例" width="90">
+        <template #default="{ row }: { row: Sketch }">
+          {{ contentOf(row) ? `1 : ${contentOf(row)?.scale}` : '—' }}
+        </template>
+      </el-table-column>
+      <el-table-column label="绘制人" width="90">
+        <template #default="{ row }: { row: Sketch }">{{ contentOf(row)?.author || '—' }}</template>
+      </el-table-column>
+      <el-table-column label="锚点桩号" width="120">
+        <template #default="{ row }: { row: Sketch }">{{ contentOf(row)?.anchorStake || '—' }}</template>
+      </el-table-column>
+      <el-table-column label="图片数据说明" min-width="180" show-overflow-tooltip>
+        <template #default="{ row }: { row: Sketch }">{{ contentOf(row)?.imageNote || '' }}</template>
+      </el-table-column>
+      <el-table-column label="操作" width="250" fixed="right">
+        <template #default="{ row }: { row: Sketch }">
+          <el-button v-if="row.draft" link type="primary" size="small" @click="editDraft(row)">编辑草稿</el-button>
+          <el-button v-if="!row.draft && row.versions.length > 0" link type="primary" size="small" @click="beginRevision(row)">
+            修订
+          </el-button>
+          <el-button v-if="row.draft" link type="success" size="small" @click="signSketch(row)">签认</el-button>
+          <el-button v-if="row.draft && row.versions.length > 0" link type="warning" size="small" @click="discardDraft(row)">
+            取消修订
+          </el-button>
+          <el-button
+            v-if="row.versions.length > 0"
+            link
+            type="info"
+            size="small"
+            @click="openHistory(row)"
+          >
+            历史版本
+          </el-button>
           <el-button link type="danger" size="small" @click="removeSketch(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
+
+    <el-dialog v-model="historyVisible" :title="'历史版本 · ' + (historySketch?.code ?? '')" width="640px">
+      <div v-if="historySketch" class="history-list">
+        <div v-for="version in historyVersions" :key="version.version" class="history-item">
+          <div class="history-head">
+            <el-tag size="small" :type="version.version === historySketch.versions.length ? 'success' : 'info'">
+              v{{ version.version }}
+              {{ version.version === historySketch.versions.length ? '（最新）' : '' }}
+            </el-tag>
+            <span class="history-meta">绘制人：{{ version.author || '—' }}</span>
+            <span class="history-meta">签认时间：{{ formatDateTime(version.signedAt) }}</span>
+          </div>
+          <div class="history-body">
+            <span>坐标纸 {{ version.gridCount }} 格</span>
+            <span>比例 1:{{ version.scale }}</span>
+            <span>锚点 {{ version.anchorStake }}</span>
+            <span>拼合顺序 {{ historySketch.mergeOrder }}</span>
+          </div>
+          <p v-if="version.imageNote" class="history-note">{{ version.imageNote }}</p>
+        </div>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -320,7 +520,42 @@ async function removeSketch(sketch: Sketch): Promise<void> {
 }
 .form-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
-  padding-left: 90px;
+  padding-left: 0;
+}
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.history-item {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.history-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.history-meta {
+  font-size: 12px;
+  color: #4a5b6b;
+}
+.history-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 12px;
+  color: #35506b;
+}
+.history-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #5a6a7a;
 }
 </style>

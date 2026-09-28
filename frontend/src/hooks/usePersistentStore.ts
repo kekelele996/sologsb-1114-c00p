@@ -5,11 +5,26 @@ import type { Cave, Segment, Sketch, Station } from '@/types'
 import { computeHorizontal, computeVertical } from '@/utils/survey'
 
 /** IndexedDB 数据结构版本号（升级迁移时使用） */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
+}
+
+/** v2 及以前的草图记录结构（v3 迁移来源） */
+interface LegacySketch {
+  id: string
+  segmentId: string
+  code: string
+  gridCount?: number
+  scale?: number
+  author?: string
+  mergeOrder?: number
+  anchorStake?: string
+  imageNote?: string
+  versions?: unknown
+  draft?: unknown
 }
 
 /** Dexie 封装：洞穴 / 洞段 / 测点 / 草图 四张表 + 元数据表 */
@@ -30,7 +45,7 @@ class CaveSurveyDb extends Dexie {
       meta: 'key'
     })
     // v2：旧版测点记录缺少水平距/垂距，迁移时由斜距 + 倾角补齐
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         caves: 'id, name, region, archived',
         segments: 'id, caveId, code, type',
@@ -48,6 +63,44 @@ class CaveSurveyDb extends Dexie {
             }
             if (!Number.isFinite(station.verticalDistance)) {
               station.verticalDistance = computeVertical(station.dip, station.slopeDistance)
+            }
+          })
+      })
+    // v3：草图引入「草稿 + 签认版本」结构。旧记录整体冻结为 v1 签认版本。
+    this.version(3)
+      .stores({
+        caves: 'id, name, region, archived',
+        segments: 'id, caveId, code, type',
+        stations: 'id, segmentId, code, date',
+        sketches: 'id, segmentId, mergeOrder',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const signedAt = new Date().toISOString()
+        await tx
+          .table<LegacySketch, string>('sketches')
+          .toCollection()
+          .modify((sketch, ctx) => {
+            if (Array.isArray(sketch.versions)) return
+            const legacy = sketch as LegacySketch
+            // 整体替换为「草稿 + 签认版本」结构：旧记录冻结为 v1
+            ctx.value = {
+              id: legacy.id,
+              segmentId: legacy.segmentId,
+              code: legacy.code,
+              mergeOrder: legacy.mergeOrder ?? 1,
+              versions: [
+                {
+                  version: 1,
+                  gridCount: legacy.gridCount ?? 40,
+                  scale: legacy.scale ?? 200,
+                  author: legacy.author ?? '',
+                  anchorStake: legacy.anchorStake ?? '',
+                  imageNote: legacy.imageNote ?? '',
+                  signedAt
+                }
+              ],
+              draft: null
             }
           })
       })
@@ -192,23 +245,52 @@ export async function seedDemoData(): Promise<void> {
       id: 'sk_demo_001',
       segmentId: segmentA,
       code: 'S-01',
-      gridCount: 48,
-      scale: 200,
-      author: '陆昀',
       mergeOrder: 1,
-      anchorStake: 'K0+000',
-      imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注'
+      versions: [
+        {
+          version: 1,
+          gridCount: 48,
+          scale: 200,
+          author: '陆昀',
+          anchorStake: 'K0+000',
+          imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注',
+          signedAt: new Date().toISOString()
+        }
+      ],
+      draft: null
     },
     {
       id: 'sk_demo_002',
       segmentId: segmentB,
       code: 'S-02',
-      gridCount: 30,
-      scale: 200,
-      author: '覃羽',
       mergeOrder: 2,
-      anchorStake: 'K0+120',
-      imageNote: '竖井剖面草图，标注三处锚点'
+      versions: [
+        {
+          version: 1,
+          gridCount: 30,
+          scale: 200,
+          author: '覃羽',
+          anchorStake: 'K0+120',
+          imageNote: '竖井剖面草图，标注三处锚点',
+          signedAt: new Date().toISOString()
+        }
+      ],
+      draft: null
+    },
+    {
+      id: 'sk_demo_003',
+      segmentId: segmentA,
+      code: 'S-03',
+      mergeOrder: 3,
+      versions: [],
+      draft: {
+        gridCount: 52,
+        scale: 200,
+        author: '陆昀',
+        anchorStake: 'K0+060',
+        imageNote: '入口廊道现场修订草稿，待负责人签字',
+        updatedAt: new Date().toISOString()
+      }
     }
   ])
 }
