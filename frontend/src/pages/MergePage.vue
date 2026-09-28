@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import type { Sketch } from '@/types'
+import type { Sketch, SketchVersion } from '@/types'
+import { hasPendingDraft, latestVersion } from '@/types'
 import ClosureBadge from '@/components/common/ClosureBadge.vue'
 import GridCanvas from '@/components/common/GridCanvas.vue'
 import SegmentTag from '@/components/common/SegmentTag.vue'
@@ -37,23 +38,40 @@ const caveSegments = computed(() =>
   segmentState.segments.filter((segment) => !selectedCaveId.value || segment.caveId === selectedCaveId.value)
 )
 
-const mergeSketches = computed<Sketch[]>(() =>
+/** 本洞穴下的全部草图 */
+const caveSketches = computed<Sketch[]>(() =>
   sketchState.sketches
     .filter((sketch) => caveSegments.value.some((segment) => segment.id === sketch.segmentId))
-    .sort((a, b) => a.mergeOrder - b.mergeOrder)
+    .sort((a, b) => a.draft.mergeOrder - b.draft.mergeOrder)
 )
+
+/** 可参与拼合的图幅：取每张草图的最新已签认版本 */
+interface SignedSheet {
+  sketch: Sketch
+  version: SketchVersion
+}
+
+const signedSheets = computed<SignedSheet[]>(() =>
+  caveSketches.value.flatMap((sketch) => {
+    const version = latestVersion(sketch)
+    return version ? [{ sketch, version }] : []
+  })
+)
+
+/** 未签认草稿：桩号吸附必须在此为空时才允许执行 */
+const pendingDrafts = computed(() => caveSketches.value.filter((sketch) => hasPendingDraft(sketch)))
 
 function segmentOf(sketch: Sketch): string {
   const segment = segmentState.segments.find((item) => item.id === sketch.segmentId)
   return segment ? segment.code : '未归属'
 }
 
-function widthOf(sketch: Sketch): number {
-  return Math.max(88, Math.round(sketch.gridCount * (200 / Math.max(10, sketch.scale)) * 4))
+function widthOf(version: SketchVersion): number {
+  return Math.max(88, Math.round(version.gridCount * (200 / Math.max(10, version.scale)) * 4))
 }
 
 const totalWidth = computed(() =>
-  mergeSketches.value.reduce((sum, sketch) => sum + widthOf(sketch) + 10, 0)
+  signedSheets.value.reduce((sum, sheet) => sum + widthOf(sheet.version) + 10, 0)
 )
 
 // IndexedDB 异步水合完成后自动选中第一条洞穴
@@ -68,11 +86,11 @@ watch(
 )
 
 watch(
-  mergeSketches,
+  signedSheets,
   (list) => {
-    list.forEach((sketch) => {
-      if (offsets[sketch.id] === undefined) offsets[sketch.id] = 0
-      if (snapped[sketch.id] === undefined) snapped[sketch.id] = false
+    list.forEach((sheet) => {
+      if (offsets[sheet.sketch.id] === undefined) offsets[sheet.sketch.id] = 0
+      if (snapped[sheet.sketch.id] === undefined) snapped[sheet.sketch.id] = false
     })
   },
   { immediate: true }
@@ -86,46 +104,64 @@ const caveStations = computed(() =>
 )
 const { result: closureResult } = useClosureCheck(caveStations)
 
+function describePending(sketch: Sketch): string {
+  const latest = latestVersion(sketch)
+  const note = latest ? `最新签认 V${latest.version}，草稿改动未签认` : '尚未签认过'
+  return `${sketch.draft.code}（洞段 ${segmentOf(sketch)}，${note}）`
+}
+
 /** 按桩号锚点自动吸附：以最小锚点桩号为原点，按桩号差换算横向偏移 */
 function autoAlign(): void {
-  const list = mergeSketches.value
-  if (list.length === 0) {
-    ElMessage.warning('当前洞穴暂无可拼合草图')
+  // 同一洞穴存在未签认草稿时必须停下，已签认图幅仍照常显示
+  if (pendingDrafts.value.length > 0) {
+    const names = pendingDrafts.value.map(describePending)
+    snapLog.value = names.map((name) => `已拦截：${name}，签认或放弃改动后才能按桩号吸附`)
+    ElMessage({
+      type: 'error',
+      message: `桩号吸附已中止：以下 ${names.length} 张草图有未签认草稿 —— ${names.join('；')}`,
+      duration: 6000,
+      showClose: true
+    })
     return
   }
-  const base = Math.min(...list.map((sketch) => stakeToNumber(sketch.anchorStake)))
+  const list = signedSheets.value
+  if (list.length === 0) {
+    ElMessage.warning('当前洞穴暂无可拼合的已签认图幅')
+    return
+  }
+  const base = Math.min(...list.map((sheet) => stakeToNumber(sheet.version.anchorStake)))
   const logs: string[] = []
-  list.forEach((sketch) => {
-    const stake = stakeToNumber(sketch.anchorStake)
+  list.forEach((sheet) => {
+    const stake = stakeToNumber(sheet.version.anchorStake)
     const target = Math.round((stake - base) * PX_PER_METER)
-    offsets[sketch.id] = target
-    snapped[sketch.id] = true
-    logs.push(`${sketch.code} 锚点 ${sketch.anchorStake} → 偏移 ${target}px`)
+    offsets[sheet.sketch.id] = target
+    snapped[sheet.sketch.id] = true
+    logs.push(`${sheet.version.code} V${sheet.version.version} 锚点 ${sheet.version.anchorStake} → 偏移 ${target}px`)
   })
   snapLog.value = logs
   ElMessage.success(`已按桩号锚点吸附 ${list.length} 张图幅`)
 }
 
-function onMouseDown(sketch: Sketch, event: MouseEvent): void {
-  draggingId.value = sketch.id
+function onMouseDown(sheet: SignedSheet, event: MouseEvent): void {
+  draggingId.value = sheet.sketch.id
   dragStartX.value = event.clientX
-  dragOriginOffset.value = offsets[sketch.id] ?? 0
+  dragOriginOffset.value = offsets[sheet.sketch.id] ?? 0
 }
 
 function onMouseMove(event: MouseEvent): void {
   if (!draggingId.value) return
   const delta = event.clientX - dragStartX.value
   const raw = Math.max(-200, Math.min(CANVAS_W - 60, dragOriginOffset.value + delta))
-  const list = mergeSketches.value
-  const index = list.findIndex((sketch) => sketch.id === draggingId.value)
+  const list = signedSheets.value
+  const index = list.findIndex((sheet) => sheet.sketch.id === draggingId.value)
   let value = Math.round(raw)
   let snapTarget: string | null = null
-  const others = list.filter((sketch) => sketch.id !== draggingId.value)
+  const others = list.filter((sheet) => sheet.sketch.id !== draggingId.value)
   for (const other of others) {
-    const otherRight = (offsets[other.id] ?? 0) + widthOf(other)
+    const otherRight = (offsets[other.sketch.id] ?? 0) + widthOf(other.version)
     if (Math.abs(value - otherRight) <= SNAP_PX) {
       value = otherRight
-      snapTarget = other.code
+      snapTarget = `${other.version.code} V${other.version.version}`
       break
     }
   }
@@ -133,7 +169,7 @@ function onMouseMove(event: MouseEvent): void {
   snapped[draggingId.value] = snapTarget !== null
   if (snapTarget) {
     const current = list[index]
-    snapLog.value = [`${current.code} 吸附到 ${snapTarget} 右边缘（偏移 ${value}px）`]
+    snapLog.value = [`${current.version.code} V${current.version.version} 吸附到 ${snapTarget} 右边缘（偏移 ${value}px）`]
   }
 }
 
@@ -145,31 +181,34 @@ function onMouseUp(): void {
 interface MergeRow {
   order: number
   code: string
+  version: number
   segment: string
+  author: string
   anchorStake: string
   offset: number
   snapped: boolean
+  sketchId: string
 }
 
 const mergeRows = computed<MergeRow[]>(() =>
-  mergeSketches.value.map((sketch, index) => ({
+  signedSheets.value.map((sheet, index) => ({
     order: index + 1,
-    code: sketch.code,
-    segment: segmentOf(sketch),
-    anchorStake: sketch.anchorStake,
-    offset: offsets[sketch.id] ?? 0,
-    snapped: snapped[sketch.id] ?? false
+    code: sheet.version.code,
+    version: sheet.version.version,
+    segment: segmentOf(sheet.sketch),
+    author: sheet.version.author,
+    anchorStake: sheet.version.anchorStake,
+    offset: offsets[sheet.sketch.id] ?? 0,
+    snapped: snapped[sheet.sketch.id] ?? false,
+    sketchId: sheet.sketch.id
   }))
 )
 
 async function move(index: number, direction: -1 | 1): Promise<void> {
-  const list = [...mergeSketches.value]
+  const list = signedSheets.value
   const target = index + direction
   if (target < 0 || target >= list.length) return
-  const temp = list[index]
-  list[index] = list[target]
-  list[target] = temp
-  await sketchStore.getState().reorder(list.map((sketch) => sketch.id))
+  await sketchStore.getState().swapOrder(list[index].sketch.id, list[target].sketch.id)
 }
 
 function exportMergeTable(): void {
@@ -179,7 +218,9 @@ function exportMergeTable(): void {
     [
       { key: 'order', label: '拼合顺序' },
       { key: 'code', label: '草图编号' },
+      { key: 'version', label: '签认版本' },
       { key: 'segment', label: '洞段' },
+      { key: 'author', label: '绘制人' },
       { key: 'anchorStake', label: '锚点桩号' },
       { key: 'offset', label: '对齐偏移(px)' },
       { key: 'snapped', label: '是否吸附' }
@@ -195,7 +236,7 @@ function exportMergeTable(): void {
       <div>
         <h2 class="page-title">图幅拼合视图</h2>
         <p class="page-sub">
-          拖动图幅可按相邻边缘吸附对齐，也可按桩号锚点一键对齐；下方输出拼合顺序表，顺序可直接调整。
+          仅已签认图幅参与拼合；存在未签认草稿时「按桩号锚点吸附」会中止并点名草图，已签认图幅仍可拖动查看。下方输出拼合顺序表。
         </p>
       </div>
       <div class="head-actions">
@@ -204,11 +245,32 @@ function exportMergeTable(): void {
       </div>
     </div>
 
+    <el-alert
+      v-if="pendingDrafts.length > 0"
+      class="pending-alert"
+      type="error"
+      show-icon
+      :closable="false"
+      title="同一洞段存在未签认草稿，桩号吸附已被拦下"
+    >
+      <ul class="pending-list">
+        <li v-for="sketch in pendingDrafts" :key="sketch.id">
+          <el-link type="danger" :underline="false" @click="$router.push('/sketch')">
+            {{ describePending(sketch) }}
+          </el-link>
+        </li>
+      </ul>
+      <span class="pending-hint">请到「草图工作台」签认或放弃修图；其余已签认图幅在下方照常显示与拖动。</span>
+    </el-alert>
+
     <div class="toolbar">
       <el-select v-model="selectedCaveId" placeholder="选择洞穴" style="width: 220px">
         <el-option v-for="cave in caveState.caves" :key="cave.id" :label="cave.name" :value="cave.id" />
       </el-select>
-      <el-tag effect="plain">图幅 {{ mergeSketches.length }} 张</el-tag>
+      <el-tag effect="plain">已签认图幅 {{ signedSheets.length }} 张</el-tag>
+      <el-tag type="warning" effect="plain" v-if="pendingDrafts.length > 0">
+        未签认草稿 {{ pendingDrafts.length }} 张
+      </el-tag>
       <el-tag effect="plain">总宽 {{ totalWidth }} px</el-tag>
       <div class="seg-tags">
         <SegmentTag
@@ -229,53 +291,53 @@ function exportMergeTable(): void {
         :height="CANVAS_H"
         :grid-size="20"
         :meters-per-grid="1"
-        title="图幅拼合台（拖动对齐 / 锚点吸附）"
+        title="图幅拼合台（仅已签认版本；拖动对齐 / 锚点吸附）"
       >
         <g
-          v-for="(sketch, index) in mergeSketches"
-          :key="sketch.id"
+          v-for="(sheet, index) in signedSheets"
+          :key="sheet.sketch.id"
           class="sheet-group"
-          @mousedown.prevent="onMouseDown(sketch, $event)"
+          @mousedown.prevent="onMouseDown(sheet, $event)"
         >
           <rect
-            :x="offsets[sketch.id] ?? 0"
+            :x="offsets[sheet.sketch.id] ?? 0"
             :y="40 + (index % 2) * 10"
-            :width="widthOf(sketch)"
+            :width="widthOf(sheet.version)"
             height="96"
             rx="6"
-            :fill="snapped[sketch.id] ? 'rgba(47,111,143,0.22)' : 'rgba(143,211,199,0.28)'"
-            :stroke="snapped[sketch.id] ? '#2f6f8f' : '#1f8a70'"
+            :fill="snapped[sheet.sketch.id] ? 'rgba(47,111,143,0.22)' : 'rgba(143,211,199,0.28)'"
+            :stroke="snapped[sheet.sketch.id] ? '#2f6f8f' : '#1f8a70'"
             stroke-width="1.6"
           />
-          <text :x="(offsets[sketch.id] ?? 0) + 8" :y="62 + (index % 2) * 10" font-size="12" fill="#1f3a4d">
-            {{ sketch.code }}
+          <text :x="(offsets[sheet.sketch.id] ?? 0) + 8" :y="62 + (index % 2) * 10" font-size="12" fill="#1f3a4d">
+            {{ sheet.version.code }} · V{{ sheet.version.version }}
           </text>
-          <text :x="(offsets[sketch.id] ?? 0) + 8" :y="80 + (index % 2) * 10" font-size="11" fill="#4a5b6b">
-            锚点 {{ sketch.anchorStake }}
+          <text :x="(offsets[sheet.sketch.id] ?? 0) + 8" :y="80 + (index % 2) * 10" font-size="11" fill="#4a5b6b">
+            锚点 {{ sheet.version.anchorStake }}
           </text>
-          <text :x="(offsets[sketch.id] ?? 0) + 8" :y="96 + (index % 2) * 10" font-size="11" fill="#7a8896">
-            1:{{ sketch.scale }} · {{ sketch.gridCount }} 格
+          <text :x="(offsets[sheet.sketch.id] ?? 0) + 8" :y="96 + (index % 2) * 10" font-size="11" fill="#7a8896">
+            1:{{ sheet.version.scale }} · {{ sheet.version.gridCount }} 格 · {{ sheet.version.author }}
           </text>
           <line
-            :x1="offsets[sketch.id] ?? 0"
+            :x1="offsets[sheet.sketch.id] ?? 0"
             :y1="136 + (index % 2) * 10"
-            :x2="(offsets[sketch.id] ?? 0) + 14"
+            :x2="(offsets[sheet.sketch.id] ?? 0) + 14"
             :y2="136 + (index % 2) * 10"
             stroke="#c98a1b"
             stroke-width="2"
           />
         </g>
         <text
-          v-if="mergeSketches.length === 0"
-          :x="CANVAS_W / 2 - 110"
+          v-if="signedSheets.length === 0"
+          :x="CANVAS_W / 2 - 130"
           :y="CANVAS_H / 2"
           font-size="13"
           fill="#8a97a3"
         >
-          该洞穴暂无草图图幅，请先到「草图工作台」建立
+          该洞穴暂无可拼合的已签认图幅，请先到「草图工作台」签认草图
         </text>
         <template #legend>
-          <span>拖动图幅可移动</span>
+          <span>拖动已签认图幅可移动</span>
           <span>绿框 = 未吸附</span>
           <span>蓝框 = 已吸附对齐</span>
           <span>橙色短划 = 锚点桩号位置</span>
@@ -301,23 +363,29 @@ function exportMergeTable(): void {
       </div>
     </div>
 
-    <h3 class="section-title">图幅拼合顺序表</h3>
+    <h3 class="section-title">图幅拼合顺序表（已签认版本）</h3>
     <el-table :data="mergeRows" border stripe>
-      <el-table-column prop="order" label="拼合顺序" width="100" />
-      <el-table-column prop="code" label="草图编号" width="120" />
-      <el-table-column prop="segment" label="洞段" width="120" />
-      <el-table-column prop="anchorStake" label="桩号对齐锚点" width="150" />
-      <el-table-column label="对齐偏移" width="120">
+      <el-table-column prop="order" label="拼合顺序" width="90" />
+      <el-table-column prop="code" label="草图编号" width="110" />
+      <el-table-column label="版本" width="80">
+        <template #default="{ row }: { row: MergeRow }">
+          <el-tag type="success" size="small" effect="plain">V{{ row.version }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="segment" label="洞段" width="100" />
+      <el-table-column prop="author" label="绘制人" width="100" />
+      <el-table-column prop="anchorStake" label="桩号对齐锚点" width="140" />
+      <el-table-column label="对齐偏移" width="110">
         <template #default="{ row }: { row: MergeRow }">{{ row.offset }} px</template>
       </el-table-column>
-      <el-table-column label="吸附状态" width="120">
+      <el-table-column label="吸附状态" width="110">
         <template #default="{ row }: { row: MergeRow }">
           <el-tag :type="row.snapped ? 'success' : 'info'" size="small" effect="plain">
             {{ row.snapped ? '已吸附' : '未吸附' }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="调整顺序" width="180">
+      <el-table-column label="调整顺序" width="170">
         <template #default="{ $index }: { $index: number }">
           <el-button link type="primary" size="small" :disabled="$index === 0" @click="move($index, -1)">上移</el-button>
           <el-button
@@ -339,6 +407,19 @@ function exportMergeTable(): void {
 .head-actions {
   display: flex;
   gap: 8px;
+}
+.pending-alert {
+  margin-bottom: 12px;
+}
+.pending-list {
+  margin: 4px 0 6px;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.9;
+}
+.pending-hint {
+  font-size: 12px;
+  color: #7a5a4a;
 }
 .seg-tags {
   display: flex;
@@ -369,6 +450,9 @@ function exportMergeTable(): void {
   font-size: 12px;
   color: #4a5b6b;
   line-height: 1.8;
+}
+.muted {
+  color: #97a3af;
 }
 .sheet-group {
   cursor: grab;

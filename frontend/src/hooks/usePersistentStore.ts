@@ -2,10 +2,11 @@ import { onUnmounted, reactive } from 'vue'
 import type { StoreApi } from 'zustand/vanilla'
 import Dexie, { type Table } from 'dexie'
 import type { Cave, Segment, Sketch, Station } from '@/types'
+import { draftEqualsVersion, draftFromVersion } from '@/types'
 import { computeHorizontal, computeVertical } from '@/utils/survey'
 
 /** IndexedDB 数据结构版本号（升级迁移时使用） */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
@@ -30,7 +31,7 @@ class CaveSurveyDb extends Dexie {
       meta: 'key'
     })
     // v2：旧版测点记录缺少水平距/垂距，迁移时由斜距 + 倾角补齐
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         caves: 'id, name, region, archived',
         segments: 'id, caveId, code, type',
@@ -49,6 +50,46 @@ class CaveSurveyDb extends Dexie {
             if (!Number.isFinite(station.verticalDistance)) {
               station.verticalDistance = computeVertical(station.dip, station.slopeDistance)
             }
+          })
+      })
+    // v3：草图拆成「可修改草稿 + 已签认版本快照」，旧记录整体冻结为 v1
+    this.version(SCHEMA_VERSION)
+      .stores({
+        caves: 'id, name, region, archived',
+        segments: 'id, caveId, code, type',
+        stations: 'id, segmentId, code, date',
+        sketches: 'id, segmentId',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<Sketch, string>('sketches')
+          .toCollection()
+          .modify((sketch) => {
+            const legacy = sketch as unknown as Record<string, unknown>
+            const content = {
+              code: typeof legacy.code === 'string' ? legacy.code : '',
+              gridCount: Number(legacy.gridCount) || 0,
+              scale: Number(legacy.scale) || 100,
+              author: typeof legacy.author === 'string' ? legacy.author : '',
+              mergeOrder: Number(legacy.mergeOrder) || 1,
+              anchorStake: typeof legacy.anchorStake === 'string' ? legacy.anchorStake : '',
+              imageNote: typeof legacy.imageNote === 'string' ? legacy.imageNote : ''
+            }
+            const v1 = { ...content, version: 1, signedAt: '' }
+            sketch.versions = [v1]
+            sketch.draft = draftFromVersion(v1)
+            sketch.draftDirty = false
+            // 已迁入草稿/版本，删除旧的顶层扁平字段
+            delete legacy.code
+            delete legacy.gridCount
+            delete legacy.scale
+            delete legacy.author
+            delete legacy.mergeOrder
+            delete legacy.anchorStake
+            delete legacy.imageNote
+            // 防御性校正：理论上 dirty=false 时草稿必然等于 v1
+            if (!draftEqualsVersion(sketch.draft, v1)) sketch.draft = draftFromVersion(v1)
           })
       })
   }
@@ -187,28 +228,57 @@ export async function seedDemoData(): Promise<void> {
     }
   ])
 
-  await db.sketches.bulkPut([
-    {
-      id: 'sk_demo_001',
-      segmentId: segmentA,
-      code: 'S-01',
-      gridCount: 48,
+  const demoV1 = (
+    patch: { id: string; segmentId: string; code: string; gridCount: number; author: string; mergeOrder: number; anchorStake: string; imageNote: string }
+  ): Sketch => {
+    const now = new Date().toISOString()
+    const content = {
+      code: patch.code,
+      gridCount: patch.gridCount,
       scale: 200,
-      author: '陆昀',
-      mergeOrder: 1,
-      anchorStake: 'K0+000',
-      imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注'
-    },
-    {
-      id: 'sk_demo_002',
-      segmentId: segmentB,
-      code: 'S-02',
-      gridCount: 30,
-      scale: 200,
-      author: '覃羽',
-      mergeOrder: 2,
-      anchorStake: 'K0+120',
-      imageNote: '竖井剖面草图，标注三处锚点'
+      author: patch.author,
+      mergeOrder: patch.mergeOrder,
+      anchorStake: patch.anchorStake,
+      imageNote: patch.imageNote
     }
-  ])
+    return {
+      id: patch.id,
+      segmentId: patch.segmentId,
+      versions: [{ ...content, version: 1, signedAt: now }],
+      draft: { ...content, updatedAt: now },
+      draftDirty: false
+    }
+  }
+
+  const signedSketch = demoV1({
+    id: 'sk_demo_001',
+    segmentId: segmentA,
+    code: 'S-01',
+    gridCount: 48,
+    author: '陆昀',
+    mergeOrder: 1,
+    anchorStake: 'K0+000',
+    imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注'
+  })
+
+  // S-02：已签认 V1，现场改图后草稿变为「修图中」，未再签认前会拦下桩号吸附
+  const revisingSketch = demoV1({
+    id: 'sk_demo_002',
+    segmentId: segmentB,
+    code: 'S-02',
+    gridCount: 30,
+    author: '覃羽',
+    mergeOrder: 2,
+    anchorStake: 'K0+120',
+    imageNote: '竖井剖面草图，标注三处锚点'
+  })
+  revisingSketch.draft = {
+    ...revisingSketch.draft,
+    gridCount: 32,
+    imageNote: '竖井剖面草图，坐标纸改按 32 格，新增井底积水区标注（待签认）',
+    updatedAt: new Date().toISOString()
+  }
+  revisingSketch.draftDirty = true
+
+  await db.sketches.bulkPut([signedSketch, revisingSketch])
 }
